@@ -92,6 +92,13 @@ def mock_riscv64_platform():
             yield
 
 
+@pytest.fixture
+def mock_musl_platform():
+    with mock.patch.object(nodeenv, 'is_x86_64_musl', return_value=True):
+        with mock.patch.object(nodeenv, 'is_riscv64', return_value=False):
+            yield
+
+
 def mck_to_out(mck):
     return '\n'.join(call[0][0] for call in mck.call_args_list)
 
@@ -269,6 +276,217 @@ def test_parse_version():
     assert nodeenv.parse_version("v21.7") == (21, 7)
     assert nodeenv.parse_version("v21.7.3") == (21, 7, 3)
     assert nodeenv.parse_version("v21.7.3+0-b20240228T18452699") == (21, 7, 3)
+
+
+def test_pad_version():
+    assert nodeenv._pad_version((4,)) == (4, 0, 0)
+    assert nodeenv._pad_version((4, 3)) == (4, 3, 0)
+    assert nodeenv._pad_version((4, 3, 1)) == (4, 3, 1)
+
+
+@pytest.mark.parametrize(
+    ('spec', 'expected'),
+    (
+        ('22', [[('>=', (22, 0, 0)), ('<', (23, 0, 0))]]),
+        ('21.7', [[('>=', (21, 7, 0)), ('<', (21, 8, 0))]]),
+        ('4.x', [[('>=', (4, 0, 0)), ('<', (5, 0, 0))]]),
+        ('4.*', [[('>=', (4, 0, 0)), ('<', (5, 0, 0))]]),
+        ('*', [[]]),
+        ('^4.3.1', [[('>=', (4, 3, 1)), ('<', (5, 0, 0))]]),
+        ('^0.4.3', [[('>=', (0, 4, 3)), ('<', (0, 5, 0))]]),
+        ('^0.0.3', [[('>=', (0, 0, 3)), ('<', (0, 0, 4))]]),
+        ('^0.x', [[('>=', (0, 0, 0)), ('<', (1, 0, 0))]]),
+        ('^0.0.x', [[('>=', (0, 0, 0)), ('<', (0, 1, 0))]]),
+        ('~4.3.1', [[('>=', (4, 3, 1)), ('<', (4, 4, 0))]]),
+        ('~4.3', [[('>=', (4, 3, 0)), ('<', (4, 4, 0))]]),
+        ('~4', [[('>=', (4, 0, 0)), ('<', (5, 0, 0))]]),
+        ('>=20.0.0', [[('>=', (20, 0, 0))]]),
+        ('>=20', [[('>=', (20, 0, 0))]]),
+        ('<21.0.0', [[('<', (21, 0, 0))]]),
+        ('>4.3', [[('>=', (4, 4, 0))]]),
+        ('>4', [[('>=', (5, 0, 0))]]),
+        ('<=4.3', [[('<', (4, 4, 0))]]),
+        ('<=4.3.1', [[('<=', (4, 3, 1))]]),
+        ('=22.11.0', [[('>=', (22, 11, 0)), ('<=', (22, 11, 0))]]),
+        ('>=20 <22', [[('>=', (20, 0, 0)), ('<', (22, 0, 0))]]),
+        ('4 - 6', [[('>=', (4, 0, 0)), ('<', (7, 0, 0))]]),
+        ('4.3.1 - 6.2.0', [[('>=', (4, 3, 1)), ('<=', (6, 2, 0))]]),
+        (
+            '8 || 10',
+            [
+                [('>=', (8, 0, 0)), ('<', (9, 0, 0))],
+                [('>=', (10, 0, 0)), ('<', (11, 0, 0))],
+            ],
+        ),
+    ),
+)
+def test_parse_node_range(spec, expected):
+    assert nodeenv.parse_node_range(spec) == expected
+
+
+@pytest.mark.parametrize(
+    'spec',
+    (
+        '', 'abc', 'system', 'latest', 'lts', '1.2.3.4', '>=', 'v', '4-6',
+        '4 - 6 - 8', '>=20 <abc', '23.0.0-nightly20240101abcdef',
+    ),
+)
+def test_parse_node_range_invalid(spec):
+    assert nodeenv.parse_node_range(spec) is None
+
+
+@pytest.mark.parametrize(
+    ('spec', 'expected'),
+    (
+        ('22.11.0', True),
+        ('v22.11.0', True),
+        ('0.10.48', True),
+        ('21.7.3+0-b20240228T18452699', True),
+        ('22', False),
+        ('22.11', False),
+        ('^22.11.0', False),
+        ('latest', False),
+        ('system', False),
+        ('23.0.0-nightly20240101abcdef', False),
+    ),
+)
+def test_is_exact_version(spec, expected):
+    assert nodeenv._is_exact_version(spec) is expected
+
+
+@pytest.mark.parametrize(
+    ('spec', 'version', 'expected'),
+    (
+        ('^4.3.1', (4, 3, 1), True),
+        ('^4.3.1', (4, 9, 1), True),
+        ('^4.3.1', (4, 3, 0), False),
+        ('^4.3.1', (5, 0, 0), False),
+        ('~4.3.1', (4, 3, 9), True),
+        ('~4.3.1', (4, 4, 0), False),
+        ('4.x', (4, 0, 0), True),
+        ('4.x', (3, 9, 9), False),
+        ('*', (0, 1, 14), True),
+        ('>=20 <22', (21, 5, 0), True),
+        ('>=20 <22', (22, 0, 0), False),
+        ('>=20 <22', (19, 9, 9), False),
+        ('8 || 10', (8, 1, 0), True),
+        ('8 || 10', (10, 1, 0), True),
+        ('8 || 10', (9, 1, 0), False),
+        ('4 - 6', (6, 17, 1), True),
+        ('4 - 6', (7, 0, 0), False),
+        ('4.3.1 - 6.2.0', (6, 2, 0), True),
+        ('4.3.1 - 6.2.0', (6, 2, 1), False),
+        ('>4.3', (4, 4, 0), True),
+        ('>4.3', (4, 3, 9), False),
+        ('22', (22, 0, 0), True),
+        # a two-part version tuple is padded before comparing
+        ('~4.3', (4, 3), True),
+    ),
+)
+def test_match_node_range(spec, version, expected):
+    ranges = nodeenv.parse_node_range(spec)
+    assert nodeenv.match_node_range(version, ranges) is expected
+
+
+@pytest.mark.usefixtures('mock_index_json', 'mock_host_platform')
+@pytest.mark.parametrize(
+    ('spec', 'expected'),
+    (
+        ('4.x', '4.9.1'),
+        ('^4.3.1', '4.9.1'),
+        ('~4.3.1', '4.3.2'),
+        ('>=10 <12', '11.15.0'),
+        ('0.10', '0.10.48'),
+        ('^0.4.3', '0.4.12'),
+        ('8 || 10', '10.18.0'),
+        ('4 - 6', '6.17.1'),
+        ('>4.3', '13.5.0'),
+        ('*', '13.5.0'),
+    ),
+)
+def test_resolve_node_version(spec, expected):
+    assert nodeenv.resolve_node_version(spec) == expected
+
+
+@pytest.mark.usefixtures('mock_index_json', 'mock_host_platform')
+def test_resolve_node_version_no_match():
+    # the fixture index has no 0.0.x releases
+    with pytest.raises(SystemExit) as excinfo:
+        nodeenv.resolve_node_version('^0.0.3')
+    assert excinfo.value.code == 1
+
+
+@pytest.mark.parametrize('spec', ('abc', '23.0.0-nightly20240101abcdef'))
+def test_resolve_node_version_passes_through_non_ranges(spec):
+    # no index fixture: a non-range must not hit the network at all
+    with mock.patch.object(nodeenv, 'urlopen') as mck:
+        assert nodeenv.resolve_node_version(spec) == spec
+    assert mck.call_count == 0
+
+
+@pytest.mark.usefixtures('mock_index_json', 'mock_musl_platform')
+def test_resolve_node_version_skips_versions_without_platform_build():
+    # no release in the fixture index ships a linux-x64-musl build
+    with pytest.raises(SystemExit) as excinfo:
+        nodeenv.resolve_node_version('4.x')
+    assert excinfo.value.code == 1
+
+
+@pytest.mark.usefixtures('mock_host_platform')
+def test_has_platform_build_without_special_platform():
+    assert nodeenv._has_platform_build({'files': []}) is True
+
+
+@pytest.mark.usefixtures('mock_musl_platform')
+def test_has_platform_build_musl():
+    assert nodeenv._has_platform_build({'files': []}) is False
+    assert nodeenv._has_platform_build(
+        {'files': ['linux-x64-musl']}) is True
+
+
+@pytest.mark.usefixtures('mock_riscv64_platform')
+def test_has_platform_build_riscv64():
+    assert nodeenv._has_platform_build({'files': []}) is False
+    assert nodeenv._has_platform_build({'files': ['linux-riscv64']}) is True
+
+
+def _run_main_resolving(argv):
+    """
+    Run main() far enough to resolve args.node, then stop
+    """
+    with mock.patch.object(sys, 'argv', ['nodeenv'] + argv):
+        with mock.patch.object(
+                nodeenv, 'create_environment') as create_environment:
+            nodeenv.main()
+    assert create_environment.call_count == 1
+    return create_environment.call_args[0][1].node
+
+
+@pytest.mark.usefixtures('mock_index_json', 'mock_host_platform')
+def test_main_resolves_range():
+    assert _run_main_resolving(['--node', '4.x', 'env']) == '4.9.1'
+
+
+@pytest.mark.usefixtures('mock_host_platform')
+def test_main_keeps_exact_version_without_network():
+    with mock.patch.object(nodeenv, 'urlopen') as mck:
+        assert _run_main_resolving(['--node', '22.11.0', 'env']) == '22.11.0'
+    assert mck.call_count == 0
+
+
+@pytest.mark.usefixtures('mock_host_platform')
+def test_main_keeps_unparseable_version_without_network():
+    version = '23.0.0-nightly20240101abcdef'
+    with mock.patch.object(nodeenv, 'urlopen') as mck:
+        assert _run_main_resolving(['--node', version, 'env']) == version
+    assert mck.call_count == 0
+
+
+@pytest.mark.skipif(nodeenv.is_WIN, reason='-n system is posix only')
+def test_main_keeps_system_without_network():
+    with mock.patch.object(nodeenv, 'urlopen') as mck:
+        assert _run_main_resolving(['--node', 'system', 'env']) == 'system'
+    assert mck.call_count == 0
 
 
 def test_clear_output():

@@ -186,6 +186,166 @@ def parse_version(version_str):
     return tuple(map(int, v))
 
 
+_EXACT_VERSION_RE = re.compile(r'^v?\d+\.\d+\.\d+(\+\S*)?$')
+
+_COMPARATOR_RE = re.compile(
+    r'^(?P<op>\^|~|>=|<=|>|<|=)?\s*'
+    r'v?(?P<major>\d+|[xX*])'
+    r'(?:\.(?P<minor>\d+|[xX*]))?'
+    r'(?:\.(?P<patch>\d+|[xX*]))?$'
+)
+
+_OPERATORS = {
+    '>=': operator.ge,
+    '>': operator.gt,
+    '<=': operator.le,
+    '<': operator.lt,
+    '=': operator.eq,
+}
+
+
+def _pad_version(version):
+    """
+    Pad a version tuple to (major, minor, patch)
+    """
+    parts = tuple(version)[:3]
+    return parts + (0,) * (3 - len(parts))
+
+
+def _is_exact_version(version_str):
+    """
+    Check that the string is a complete version and needs no resolving
+    """
+    return _EXACT_VERSION_RE.match(version_str) is not None
+
+
+def _is_wildcard(part):
+    """
+    Check that a version part is missing or a wildcard
+    """
+    return part is None or part in ('x', 'X', '*')
+
+
+def _comparator_constraints(match):
+    """
+    Expand a single semver comparator to a list of (operator, version)
+
+    Partial versions round up to the next release, as npm does:
+    `>4.3` means `>=4.4.0` and `<=4.3` means `<4.4.0`.
+    """
+    op = match.group('op') or '='
+    major, minor, patch = (
+        match.group('major'), match.group('minor'), match.group('patch'))
+
+    if _is_wildcard(major):
+        return []
+
+    major = int(major)
+    has_minor = not _is_wildcard(minor)
+    has_patch = has_minor and not _is_wildcard(patch)
+    minor = int(minor) if has_minor else 0
+    patch = int(patch) if has_patch else 0
+    low = (major, minor, patch)
+
+    next_major = (major + 1, 0, 0)
+    next_minor = (major, minor + 1, 0)
+
+    if op == '^':
+        # allow changes that do not modify the leftmost non-zero part
+        if not has_minor or major > 0:
+            return [('>=', low), ('<', next_major)]
+        if not has_patch or minor > 0:
+            return [('>=', low), ('<', next_minor)]
+        return [('>=', low), ('<', (0, 0, patch + 1))]
+
+    if op == '~':
+        if not has_minor:
+            return [('>=', low), ('<', next_major)]
+        return [('>=', low), ('<', next_minor)]
+
+    if op == '=':
+        if not has_minor:
+            return [('>=', low), ('<', next_major)]
+        if not has_patch:
+            return [('>=', low), ('<', next_minor)]
+        return [('>=', low), ('<=', low)]
+
+    if op == '>':
+        if not has_minor:
+            return [('>=', next_major)]
+        if not has_patch:
+            return [('>=', next_minor)]
+        return [('>', low)]
+
+    if op == '<=':
+        if not has_minor:
+            return [('<', next_major)]
+        if not has_patch:
+            return [('<', next_minor)]
+        return [('<=', low)]
+
+    # '>=' and '<' take the version padded with zeros
+    return [(op, low)]
+
+
+def _parse_comparator(token):
+    """
+    Parse one comparator, return None if it is not valid
+    """
+    match = _COMPARATOR_RE.match(token)
+    if match is None:
+        return None
+    return _comparator_constraints(match)
+
+
+def parse_node_range(spec):
+    """
+    Parse an npm-style semver range
+
+    Return a list of alternatives, each a list of (operator, version)
+    constraints that must all hold, or None if `spec` is not a range.
+    """
+    if not spec:
+        return None
+
+    ranges = []
+    for alternative in spec.split('||'):
+        tokens = alternative.split()
+        if not tokens:
+            return None
+
+        if '-' in tokens:
+            # hyphen range: `4.3.1 - 6.2.0`
+            if len(tokens) != 3 or tokens[1] != '-':
+                return None
+            groups = [
+                _parse_comparator('>=' + tokens[0]),
+                _parse_comparator('<=' + tokens[2]),
+            ]
+        else:
+            groups = [_parse_comparator(token) for token in tokens]
+
+        constraints = []
+        for group in groups:
+            if group is None:
+                return None
+            constraints.extend(group)
+        ranges.append(constraints)
+
+    return ranges
+
+
+def match_node_range(version, ranges):
+    """
+    Check that a version tuple satisfies any of the parsed alternatives
+    """
+    version = _pad_version(version)
+    return any(
+        all(_OPERATORS[op](version, other) for op, other in constraints)
+        for constraints in ranges
+    )
+
+
 def node_version_from_args(args):
     """
     Parse the node version from the argparse args
@@ -247,6 +407,9 @@ def make_parser():
         help='The node.js version to use, e.g., '
         '--node=0.4.3 will use the node-v0.4.3 '
         'to create the new environment. '
+        'Accepts npm-style semver ranges too, e.g. --node=22, '
+        '--node=4.x or --node="^4.3.1", resolved to the highest '
+        'matching release. '
         'The default is last stable version (`latest`). '
         'Use `lts` to use the latest LTS release. '
         'Use `system` to use system-wide node.')
@@ -1088,6 +1251,18 @@ def print_node_versions():
         logger.info('\t'.join(chunk))
 
 
+def _has_platform_build(version_entry):
+    """
+    Check that the version ships a prebuilt package for the host platform
+    """
+    if is_x86_64_musl() and "linux-x64-musl" not in version_entry['files']:
+        return False
+    elif is_riscv64() and "linux-riscv64" not in version_entry['files']:
+        return False
+
+    return True
+
+
 def _get_last_node_version(lts=False):
     """
     Return last node.js version matching the filter
@@ -1100,12 +1275,7 @@ def _get_last_node_version(lts=False):
         if lts and not v['lts']:
             return False
 
-        if is_x86_64_musl() and "linux-x64-musl" not in v['files']:
-            return False
-        elif is_riscv64() and "linux-riscv64" not in v['files']:
-            return False
-
-        return True
+        return _has_platform_build(v)
 
     return next((v['version'].lstrip('v')
                  for v in _get_versions_json() if version_filter(v)), None)
@@ -1123,6 +1293,32 @@ def get_last_lts_node_version():
     Return the last node.js version marked as LTS
     """
     return _get_last_node_version(lts=True)
+
+
+def resolve_node_version(spec):
+    """
+    Resolve a semver range to the highest matching node.js version
+
+    Strings that are not a valid range are returned unchanged, so custom
+    and nightly version strings keep working.
+    """
+    ranges = parse_node_range(spec)
+    if ranges is None:
+        return spec
+
+    matched = []
+    for version_entry in _get_versions_json():
+        if not _has_platform_build(version_entry):
+            continue
+        version = _pad_version(parse_version(version_entry['version']))
+        if match_node_range(version, ranges):
+            matched.append(version)
+
+    if not matched:
+        logger.error("No available node.js version matches '%s'" % spec)
+        sys.exit(1)
+
+    return '.'.join(str(part) for part in max(matched))
 
 
 def get_env_dir(args):
@@ -1189,6 +1385,11 @@ def main():
         args.node = get_last_stable_node_version()
     elif args.node.lower() == 'lts':
         args.node = get_last_lts_node_version()
+    elif args.node.lower() != 'system' and not _is_exact_version(args.node):
+        resolved = resolve_node_version(args.node)
+        if resolved != args.node:
+            logger.info(" * Resolved '%s' to %s" % (args.node, resolved))
+        args.node = resolved
 
     if args.list:
         print_node_versions()
